@@ -1,8 +1,8 @@
 package cron
 
 import (
+	"container/heap"
 	"context"
-	"sort"
 	"sync"
 	"time"
 )
@@ -11,7 +11,7 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries   []*Entry
+	entries   EntryHeap
 	chain     Chain
 	stop      chan struct{}
 	add       chan *Entry
@@ -75,40 +75,21 @@ type Entry struct {
 // Valid returns true if this is not the zero entry.
 func (e Entry) Valid() bool { return e.ID != 0 }
 
-// byTime is a wrapper for sorting the entry array by time
-// (with zero time at the end).
-type byTime []*Entry
-
-func (s byTime) Len() int      { return len(s) }
-func (s byTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s byTime) Less(i, j int) bool {
-	// Two zero times should return false.
-	// Otherwise, zero is "greater" than any other time.
-	// (To sort it at the end of the list.)
-	if s[i].Next.IsZero() {
-		return false
-	}
-	if s[j].Next.IsZero() {
-		return true
-	}
-	return s[i].Next.Before(s[j].Next)
-}
-
 // New returns a new Cron job runner, modified by the given options.
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
@@ -172,7 +153,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		Job:        cmd,
 	}
 	if !c.running {
-		c.entries = append(c.entries, entry)
+		heap.Push(&c.entries, entry)
 	} else {
 		c.add <- entry
 	}
@@ -247,14 +228,19 @@ func (c *Cron) run() {
 
 	// Figure out the next activation times for each entry.
 	now := c.now()
-	for _, entry := range c.entries {
+	sortedEntries := new(EntryHeap)
+	for len(c.entries) > 0 {
+		entry := heap.Pop(&c.entries).(*Entry)
 		entry.Next = entry.Schedule.Next(now)
+		heap.Push(sortedEntries, entry)
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
+	c.entries = *sortedEntries
 
 	for {
 		// Determine the next entry to run.
-		sort.Sort(byTime(c.entries))
+		// User min-heap no need sort anymore
+		//sort.Sort(byTime(c.entries))
 
 		var timer *time.Timer
 		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
@@ -272,13 +258,16 @@ func (c *Cron) run() {
 				c.logger.Info("wake", "now", now)
 
 				// Run every entry whose next time was less than now
-				for _, e := range c.entries {
-					if e.Next.After(now) || e.Next.IsZero() {
+				for {
+					e := c.entries.Peek()
+					if e == nil || e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
+					e = heap.Pop(&c.entries).(*Entry)
 					c.startJob(e.WrappedJob)
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
+					heap.Push(&c.entries, e)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
@@ -286,7 +275,7 @@ func (c *Cron) run() {
 				timer.Stop()
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
-				c.entries = append(c.entries, newEntry)
+				heap.Push(&c.entries, newEntry)
 				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
 
 			case replyChan := <-c.snapshot:
@@ -356,11 +345,10 @@ func (c *Cron) entrySnapshot() []Entry {
 }
 
 func (c *Cron) removeEntry(id EntryID) {
-	var entries []*Entry
-	for _, e := range c.entries {
-		if e.ID != id {
-			entries = append(entries, e)
+	for idx, e := range c.entries {
+		if e.ID == id {
+			heap.Remove(&c.entries, idx)
+			return
 		}
 	}
-	c.entries = entries
 }
