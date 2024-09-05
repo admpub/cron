@@ -494,6 +494,10 @@ func TestJob(t *testing.T) {
 	if actualName := cron.Entry(job5).Job.(testJob).name; actualName != "job5" {
 		t.Error("wrong job retrieved:", actualName)
 	}
+
+	cron.RemoveJob(func(e *Entry) (bool, bool) {
+		return e.ID == job2, true
+	})
 }
 
 // Issue #206
